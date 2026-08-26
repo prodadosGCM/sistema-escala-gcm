@@ -78,7 +78,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-title">📅 Sistema de Escalas | GCMCF</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">Download seguro de escalas com marca d\'água digital e banco de dados Supabase.</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">Download de escalas.</div>', unsafe_allow_html=True)
 
 # =====================================================
 # FUNÇÕES DE SEGURANÇA E SESSÃO
