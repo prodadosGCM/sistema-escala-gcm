@@ -246,8 +246,7 @@ def criar_pdf_marca_dagua(matricula, largura, altura, dpi=150):
     # Uma imagem RGBA por formato de página, sem texto vetorial.
     w = max(1, round(largura * dpi / 72))
     h = max(1, round(altura * dpi / 72))
-    lado = math.ceil(math.hypot(w, h)) + 4
-    tamanho = max(12, round(10 * dpi / 72))
+    tamanho = max(12, round(8 * dpi / 72))
     try:
         fonte = ImageFont.truetype("DejaVuSans-Bold.ttf", tamanho)
     except OSError:
@@ -255,20 +254,47 @@ def criar_pdf_marca_dagua(matricula, largura, altura, dpi=150):
     texto = str(matricula).strip()
     if not texto:
         raise ValueError("Matrícula não informada")
-    passo_x = math.ceil(fonte.getlength(texto)) + round(12 * dpi / 72)
-    passo_y = round(23 * dpi / 72)
-    import random
-    rng = random.Random(texto)
+    # Linhas mais próximas, com verificação de colisão por máscara.
+    from PIL import ImageChops, ImageFilter
+    bbox = fonte.getbbox(texto)
+    selo = Image.new("RGBA", (bbox[2]-bbox[0]+4, bbox[3]-bbox[1]+4))
+    ImageDraw.Draw(selo).text((2-bbox[0], 2-bbox[1]), texto,
+                              font=fonte, fill=(0, 0, 0, 53))
+    selos = [selo.rotate(a, expand=True, resample=Image.Resampling.BICUBIC)
+             for a in (35, -35)]
+    mascaras = [i.getchannel("A").point(lambda v: 255 if v else 0) for i in selos]
+    passo_x = max(i.width for i in selos) + 3
+    passo_y = max(1, round(max(i.height for i in selos)*0.63))
     imagem = Image.new("RGBA", (w, h))
-    for angulo, alpha, espacamento in [(35, 60, passo_y), (-35, 48, passo_y), (0, 35, passo_y * 3)]:
-        camada = Image.new("RGBA", (lado, lado))
-        desenho = ImageDraw.Draw(camada)
-        for i, y in enumerate(range(0, lado, espacamento)):
-            for x in range(-passo_x + (i % 2) * (passo_x // 2), lado, passo_x):
-                desenho.text((x + rng.randint(-4, 4), y + rng.randint(-3, 3)), texto, font=fonte, fill=(0, 0, 0, max(27, min(76, alpha + rng.randint(-8, 8)))))
-        camada = camada.rotate(angulo, resample=Image.Resampling.BICUBIC)
-        x0, y0 = (lado - w) // 2, (lado - h) // 2
-        imagem = Image.alpha_composite(imagem, camada.crop((x0, y0, x0 + w, y0 + h)))
+    ocupado = Image.new("L", (w, h))
+    # Primeiro as linhas cruzadas; depois preenche as lacunas com
+    # novas matrículas completas, mantendo distância entre os caracteres.
+    def inserir(x, y, k):
+        marca, mascara = selos[k], mascaras[k]
+        px, py = x-marca.width//2, y-marca.height//2
+        if px < 0 or py < 0 or px+marca.width > w or py+marca.height > h:
+            return False
+        area = (px, py, px+marca.width, py+marca.height)
+        if ImageChops.multiply(ocupado.crop(area), mascara).getbbox():
+            return False
+        imagem.alpha_composite(marca, (px, py))
+        ocupado.paste(255, area, mascara.filter(ImageFilter.MaxFilter(3)))
+        return True
+
+    for linha, y in enumerate(range(passo_y//2, h, passo_y)):
+        for coluna, x in enumerate(range(passo_x//2, w, passo_x)):
+            inserir(x, y, (linha+coluna)%2)
+    for linha, y in enumerate(range(passo_y//2, h, max(8, passo_y//2))):
+        for coluna, x in enumerate(range(passo_x//2, w, max(8, passo_x//3))):
+            k = (linha+coluna+1)%2
+            if not inserir(x, y, k):
+                inserir(x, y, 1-k)
+    # Varredura fina para preencher as lacunas restantes.
+    for linha, y in enumerate(range(0, h, 4)):
+        for coluna, x in enumerate(range(0, w, 4)):
+            k = (linha + coluna) % 2
+            if not inserir(x, y, k):
+                inserir(x, y, 1-k)
     png = BytesIO()
     imagem.save(png, format="PNG")
     png.seek(0)
