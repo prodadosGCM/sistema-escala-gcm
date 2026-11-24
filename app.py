@@ -7,8 +7,10 @@ import hashlib
 import time
 from io import BytesIO
 
-from pypdf import PdfReader, PdfWriter
-from reportlab.lib.pagesizes import A4
+from pypdf import PdfReader, PdfWriter, Transformation
+from PIL import Image, ImageDraw, ImageFont
+from reportlab.lib.utils import ImageReader
+import math
 from reportlab.pdfgen import canvas
 
 # =====================================================
@@ -240,58 +242,68 @@ def alterar_senha_usuario_supabase(id_usuario, nova_senha):
 # =====================================================
 # MOTOR DE MARCA D'ÁGUA ULTRA-DENSO ANTI-IA
 # =====================================================
-def criar_pdf_marca_dagua(matricula):
+def criar_pdf_marca_dagua(matricula, largura, altura, dpi=150):
+    # Uma imagem RGBA por formato de página, sem texto vetorial.
+    w = max(1, round(largura * dpi / 72))
+    h = max(1, round(altura * dpi / 72))
+    lado = math.ceil(math.hypot(w, h)) + 4
+    tamanho = max(12, round(10 * dpi / 72))
+    try:
+        fonte = ImageFont.truetype("DejaVuSans-Bold.ttf", tamanho)
+    except OSError:
+        fonte = ImageFont.load_default(size=tamanho)
+    texto = str(matricula).strip()
+    if not texto:
+        raise ValueError("Matrícula não informada")
+    passo_x = math.ceil(fonte.getlength(texto)) + round(12 * dpi / 72)
+    passo_y = round(23 * dpi / 72)
+    import random
+    rng = random.Random(texto)
+    imagem = Image.new("RGBA", (w, h))
+    for angulo, alpha, espacamento in [(35, 60, passo_y), (-35, 48, passo_y), (0, 35, passo_y * 3)]:
+        camada = Image.new("RGBA", (lado, lado))
+        desenho = ImageDraw.Draw(camada)
+        for i, y in enumerate(range(0, lado, espacamento)):
+            for x in range(-passo_x + (i % 2) * (passo_x // 2), lado, passo_x):
+                desenho.text((x + rng.randint(-4, 4), y + rng.randint(-3, 3)), texto, font=fonte, fill=(0, 0, 0, max(27, min(76, alpha + rng.randint(-8, 8)))))
+        camada = camada.rotate(angulo, resample=Image.Resampling.BICUBIC)
+        x0, y0 = (lado - w) // 2, (lado - h) // 2
+        imagem = Image.alpha_composite(imagem, camada.crop((x0, y0, x0 + w, y0 + h)))
+    png = BytesIO()
+    imagem.save(png, format="PNG")
+    png.seek(0)
     buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    opacidades = [0.15, 0.22, 0.28, 0.18]
-    linha_texto = "  ".join([f"{matricula}"] * 50)
-    
-    for i, y in enumerate(range(-400, 1200, 20)): 
-        c.saveState()
-        opacidade_atual = opacidades[i % len(opacidades)]
-        c.setFillColorRGB(0, 0, 0)
-        c.setFillAlpha(opacidade_atual)
-        c.setFont("Helvetica-Bold", 10)
-        x_dinamico = -200 - (y * 0.4) + (i % 3 * 15)
-        c.translate(x_dinamico, y) 
-        c.rotate(35)
-        c.drawString(0, 0, linha_texto)
-        c.restoreState()
-        
-    for i, y in enumerate(range(-400, 1200, 40)): 
-        c.saveState()
-        c.setFillColorRGB(0.1, 0.1, 0.1)
-        c.setFillAlpha(0.12)
-        c.setFont("Helvetica-Bold", 9)
-        x_dinamico = -100 + (y * 0.3)
-        c.translate(x_dinamico, y)
-        c.rotate(-35)
-        c.drawString(0, 0, linha_texto)
-        c.restoreState()
-            
+    c = canvas.Canvas(buffer, pagesize=(largura, altura), pageCompression=1)
+    c.drawImage(ImageReader(png), 0, 0, width=largura, height=altura, mask="auto")
     c.showPage()
     c.save()
     buffer.seek(0)
     return buffer
 
+
 def aplicar_marca_dagua(pdf_original_bytes, matricula):
     try:
-        pdf_original = PdfReader(BytesIO(pdf_original_bytes))
-        pdf_marca = PdfReader(criar_pdf_marca_dagua(matricula))
-        escritor_pdf = PdfWriter()
-        pagina_marca = pdf_marca.pages[0]
-        
-        for pagina in pdf_original.pages:
-            pagina.merge_page(pagina_marca)
-            escritor_pdf.add_page(pagina)
-            
+        escritor_pdf = PdfWriter(clone_from=BytesIO(pdf_original_bytes))
+        marcas = {}
+        for pagina in escritor_pdf.pages:
+            if pagina.rotation:
+                pagina.transfer_rotation_to_content()
+            caixa = pagina.cropbox
+            largura, altura = float(caixa.width), float(caixa.height)
+            chave = (largura, altura)
+            if chave not in marcas:
+                marcas[chave] = PdfReader(criar_pdf_marca_dagua(matricula, largura, altura))
+            pagina.merge_transformed_page(
+                marcas[chave].pages[0],
+                Transformation().translate(float(caixa.left), float(caixa.bottom)),
+                over=True,
+            )
         buffer_saida = BytesIO()
         escritor_pdf.write(buffer_saida)
-        buffer_saida.seek(0)
         return buffer_saida.getvalue()
     except Exception as e:
         st.error(f"Erro ao processar marca d'água no PDF: {e}")
-        return pdf_original_bytes
+        return None
 
 # =====================================================
 # ENGINE DE COMUNICAÇÃO (SUPABASE STORAGE)
@@ -469,6 +481,9 @@ def view_visualizar_escala_usuario():
         
         if pdf_original:
             pdf_com_marca = aplicar_marca_dagua(pdf_original, matricula)
+            if pdf_com_marca is None:
+                st.warning("Download bloqueado: não foi possível aplicar a marca d'água de segurança.")
+                continue
             st.download_button(
                 label=f"📥 Baixar Escala do {nome_exibicao} ({matricula})",
                 data=pdf_com_marca,
