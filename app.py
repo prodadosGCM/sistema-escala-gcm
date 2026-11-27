@@ -5,6 +5,8 @@ from supabase import create_client
 from datetime import datetime
 import hashlib
 import time
+import logging
+from functools import partial
 from io import BytesIO
 
 from pypdf import PdfReader, PdfWriter, Transformation
@@ -107,7 +109,6 @@ def init_session():
 init_session()
 
 def logout():
-    st.session_state.pop("escala_preparada", None)
     for chave in ["logado", "usuario_id", "tipo_usuario", "primeiro_acesso", "nome_usuario", "login_usuario"]:
         st.session_state[chave] = None
     st.session_state["logado"] = False
@@ -344,8 +345,7 @@ def aplicar_marca_dagua(pdf_original_bytes, matricula):
         escritor_pdf.write(buffer_saida)
         return buffer_saida.getvalue()
     except Exception as e:
-        st.error(f"Erro ao processar marca d'água no PDF: {e}")
-        return None
+        raise RuntimeError("Falha ao aplicar marca d'água no PDF.") from e
 
 # =====================================================
 # ENGINE DE COMUNICAÇÃO (SUPABASE STORAGE)
@@ -495,6 +495,32 @@ def view_gerenciar_escala_admin():
 # =====================================================
 # INTERFACE DO AGENTE
 # =====================================================
+def gerar_download_escala(nome, matricula, usuario, usuario_id):
+    # Executado somente no clique, em thread separada: sem comandos de UI.
+    try:
+        contas = supabase.table("usuarios").select("id,login,status,tipo_usuario,primeiro_acesso").eq("id", usuario_id).execute().data
+        if not contas or str(contas[0]["status"]).strip().upper() != "ATIVO" or str(contas[0]["login"]).strip().upper() != matricula or contas[0]["tipo_usuario"] != "agente" or str(contas[0]["primeiro_acesso"]).lower() in ("1", "true"):
+            raise PermissionError("Conta sem autorização para download.")
+        original = supabase.storage.from_("escalas").download(nome)
+        if not original:
+            raise RuntimeError("Escala indisponível.")
+        resultado = aplicar_marca_dagua(original, matricula)
+        if not resultado:
+            raise RuntimeError("Download bloqueado: falha na marca d'água.")
+        agora = datetime.now(TZ)
+        supabase.table("log_auditoria").insert({
+            "data": agora.strftime("%d/%m/%Y"),
+            "hora": agora.strftime("%H:%M:%S"),
+            "usuario": str(usuario).strip().upper(),
+            "acao": "DOWNLOAD_ESCALA",
+            "detalhes": f"{nome} | Matrícula: {matricula}".upper(),
+        }).execute()
+        return resultado
+    except Exception:
+        logging.exception("Falha na geração do download da escala")
+        raise
+
+
 def view_visualizar_escala_usuario():
     st.subheader("📥 Central de Downloads - Escalas de Serviço")
     st.info("Selecione o mês e o ano abaixo para listar as escalas disponíveis para download.")
@@ -511,11 +537,6 @@ def view_visualizar_escala_usuario():
         
     st.markdown("---")
     
-    contexto = (st.session_state["usuario_id"], matricula, mes_desejado, ano_desejado)
-    preparado = st.session_state.get("escala_preparada")
-    if preparado and preparado["contexto"] != contexto:
-        st.session_state.pop("escala_preparada", None)
-
     # Consulta somente metadados, sem baixar PDFs.
     try:
         arquivos = set()
@@ -537,33 +558,15 @@ def view_visualizar_escala_usuario():
         if nome not in arquivos:
             st.button("Escala não publicada", key=f"indisponivel_{nome}", disabled=True)
             continue
-        if st.button(f"Preparar download — {nome_exibicao}", key=f"preparar_{nome}"):
-            st.session_state.pop("escala_preparada", None)
-            with st.spinner("Aplicando marca d'água na escala selecionada..."):
-                original = baixar_escala_original(nome)
-                if not original:
-                    st.error("Não foi possível baixar a escala original.")
-                else:
-                    resultado = aplicar_marca_dagua(original, matricula)
-                    if resultado is not None:
-                        st.session_state["escala_preparada"] = {
-                            "contexto": contexto, "nome": nome, "dados": resultado
-                        }
-                    else:
-                        st.warning("Download bloqueado: falha na marca d'água.")
-            if st.session_state.get("escala_preparada"):
-                st.rerun()
-        preparado = st.session_state.get("escala_preparada")
-        if preparado and preparado["contexto"] == contexto and preparado["nome"] == nome:
-            st.download_button(
-                label=f"📥 Baixar Escala do {nome_exibicao} ({matricula})",
-                data=preparado["dados"],
-                file_name=f"{nome[:-4]}_{matricula}.pdf",
-                mime="application/pdf",
-                key=f"baixar_{nome}",
-                on_click=registrar_log,
-                args=(st.session_state["nome_usuario"], "DOWNLOAD_ESCALA", f"{nome} | Matrícula: {matricula}")
-            )
+        st.download_button(
+            label=f"📥 Baixar Escala do {nome_exibicao} ({matricula})",
+            data=partial(gerar_download_escala, nome, matricula,
+                         st.session_state["nome_usuario"], st.session_state["usuario_id"]),
+            file_name=f"{nome[:-4]}_{matricula}.pdf",
+            mime="application/pdf",
+            key=f"baixar_{nome}_{matricula}",
+            on_click="ignore",
+        )
         st.divider()
 
 # =====================================================
