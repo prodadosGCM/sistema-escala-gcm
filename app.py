@@ -107,6 +107,7 @@ def init_session():
 init_session()
 
 def logout():
+    st.session_state.pop("escala_preparada", None)
     for chave in ["logado", "usuario_id", "tipo_usuario", "primeiro_acesso", "nome_usuario", "login_usuario"]:
         st.session_state[chave] = None
     st.session_state["logado"] = False
@@ -290,8 +291,8 @@ def criar_pdf_marca_dagua(matricula, largura, altura, dpi=150):
             if not inserir(x, y, k):
                 inserir(x, y, 1-k)
     # Varredura fina para preencher as lacunas restantes.
-    for linha, y in enumerate(range(0, h, 4)):
-        for coluna, x in enumerate(range(0, w, 4)):
+    for linha, y in enumerate(range(0, h, 12)):
+        for coluna, x in enumerate(range(0, w, 12)):
             k = (linha + coluna) % 2
             if not inserir(x, y, k):
                 inserir(x, y, 1-k)
@@ -498,7 +499,10 @@ def view_visualizar_escala_usuario():
     st.subheader("📥 Central de Downloads - Escalas de Serviço")
     st.info("Selecione o mês e o ano abaixo para listar as escalas disponíveis para download.")
     
-    matricula = st.session_state.get("login_usuario", "SEM_MATRICULA").upper()
+    matricula = str(st.session_state.get("login_usuario") or "").strip().upper()
+    if not matricula:
+        st.error("Matrícula não identificada. Entre novamente.")
+        return
     col_mes, col_ano = st.columns(2)
     with col_mes:
         mes_desejado = st.selectbox("Filtrar por Mês:", MESES)
@@ -507,36 +511,60 @@ def view_visualizar_escala_usuario():
         
     st.markdown("---")
     
+    contexto = (st.session_state["usuario_id"], matricula, mes_desejado, ano_desejado)
+    preparado = st.session_state.get("escala_preparada")
+    if preparado and preparado["contexto"] != contexto:
+        st.session_state.pop("escala_preparada", None)
+
+    # Consulta somente metadados, sem baixar PDFs.
+    try:
+        arquivos = set()
+        for prefixo in ESCALAS_DISPONIVEIS.values():
+            nome = gerar_nome_arquivo(prefixo, mes_desejado, ano_desejado)
+            itens = supabase.storage.from_("escalas").list(
+                path="", options={"search": nome, "limit": 100}
+            )
+            if any(item.get("name") == nome for item in itens):
+                arquivos.add(nome)
+    except Exception as e:
+        st.error(f"Não foi possível consultar as escalas: {e}")
+        return
+
     for nome_exibicao, prefixo in ESCALAS_DISPONIVEIS.items():
-        nome_arquivo_target = gerar_nome_arquivo(prefixo, mes_desejado, ano_desejado)
-        
-        st.markdown(f"""
-        <div class="escala-container">
-            <div class="escala-titulo">📋 Escala do {nome_exibicao}</div>
-            <div class="escala-detalhe">Período de Referência: {mes_desejado} de {ano_desejado} | Ficheiro: {nome_arquivo_target}</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        file_key = f"btn_{prefixo}_{mes_desejado}_{ano_desejado}"
-        pdf_original = baixar_escala_original(nome_arquivo_target)
-        
-        if pdf_original:
-            pdf_com_marca = aplicar_marca_dagua(pdf_original, matricula)
-            if pdf_com_marca is None:
-                st.warning("Download bloqueado: não foi possível aplicar a marca d'água de segurança.")
-                continue
+        nome = gerar_nome_arquivo(prefixo, mes_desejado, ano_desejado)
+        st.markdown(f"### 📋 Escala do {nome_exibicao}")
+        st.caption(f"{mes_desejado} de {ano_desejado}")
+        if nome not in arquivos:
+            st.button("Escala não publicada", key=f"indisponivel_{nome}", disabled=True)
+            continue
+        if st.button(f"Preparar download — {nome_exibicao}", key=f"preparar_{nome}"):
+            st.session_state.pop("escala_preparada", None)
+            with st.spinner("Aplicando marca d'água na escala selecionada..."):
+                original = baixar_escala_original(nome)
+                if not original:
+                    st.error("Não foi possível baixar a escala original.")
+                else:
+                    resultado = aplicar_marca_dagua(original, matricula)
+                    if resultado is not None:
+                        st.session_state["escala_preparada"] = {
+                            "contexto": contexto, "nome": nome, "dados": resultado
+                        }
+                    else:
+                        st.warning("Download bloqueado: falha na marca d'água.")
+            if st.session_state.get("escala_preparada"):
+                st.rerun()
+        preparado = st.session_state.get("escala_preparada")
+        if preparado and preparado["contexto"] == contexto and preparado["nome"] == nome:
             st.download_button(
                 label=f"📥 Baixar Escala do {nome_exibicao} ({matricula})",
-                data=pdf_com_marca,
-                file_name=f"{nome_arquivo_target.replace('.pdf', '')}_{matricula}.pdf",
+                data=preparado["dados"],
+                file_name=f"{nome[:-4]}_{matricula}.pdf",
                 mime="application/pdf",
-                key=file_key,
+                key=f"baixar_{nome}",
                 on_click=registrar_log,
-                args=(st.session_state["nome_usuario"], "DOWNLOAD_ESCALA", f"{nome_arquivo_target} | Matrícula: {matricula}")
+                args=(st.session_state["nome_usuario"], "DOWNLOAD_ESCALA", f"{nome} | Matrícula: {matricula}")
             )
-        else:
-            st.button(f"❌ Escala do {nome_exibicao} Não Publicada", key=file_key, disabled=True)
-        st.markdown("<br>", unsafe_allow_html=True)
+        st.divider()
 
 # =====================================================
 # RENDERIZAÇÃO E CONTROLE DE TELAS
